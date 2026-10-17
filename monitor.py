@@ -1,8 +1,8 @@
-
 import os
 import json
 import re
 from pathlib import Path
+from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse, parse_qs
 
 import requests
@@ -14,6 +14,9 @@ WEBHOOK = os.environ["DISCORD_WEBHOOK"]
 
 FS_GREEN = 0x76B900
 MAX_NEW_MODS = 10
+
+# URL del icono verde "25" que aparece arriba a la derecha como Thumbnail
+ICON_25_URL = "https://cdn.farming-simulator.com/favicon.ico" # O la URL directa del logo verde de FS25
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; FS25ModHubMonitor/2.0)"
@@ -91,18 +94,23 @@ def get_next_value(lines, label):
 
 
 def get_mod_details(mod):
-    """Obtiene autor, categoría, plataformas e imagen de la ficha."""
+    """Obtiene todos los atributos detallados de la ficha del mod."""
     details = {
-        "author": None,
-        "category": None,
-        "platform": None,
+        "author": "N/A",
+        "category": "N/A",
+        "platform": "PC/MAC, PS5, XBS, S2",
+        "manufacturer": None,
+        "size": None,
+        "version": "1.0.0.0",
+        "released": None,
+        "game": "Farming Simulator 25",
         "image": mod.get("image"),
     }
 
     try:
         soup = get_soup(mod["url"])
 
-        # La imagen principal suele estar en los metadatos de la ficha.
+        # Imagen principal (OG / Twitter metadata)
         for attribute in (
             {"property": "og:image"},
             {"name": "twitter:image"},
@@ -114,16 +122,39 @@ def get_mod_details(mod):
                 )
                 break
 
-        # Extraer los datos visibles de la página.
         lines = [
             line.strip()
             for line in soup.get_text("\n").splitlines()
             if line.strip()
         ]
 
-        details["author"] = get_next_value(lines, "Author")
-        details["category"] = get_next_value(lines, "Category")
-        details["platform"] = get_next_value(lines, "Platform")
+        author = get_next_value(lines, "Author")
+        if author:
+            details["author"] = author
+
+        category = get_next_value(lines, "Category")
+        if category:
+            details["category"] = category
+
+        platform = get_next_value(lines, "Platform")
+        if platform:
+            details["platform"] = platform
+
+        manufacturer = get_next_value(lines, "Manufacturer")
+        if manufacturer:
+            details["manufacturer"] = manufacturer
+
+        size = get_next_value(lines, "Size")
+        if size:
+            details["size"] = size
+
+        version = get_next_value(lines, "Version")
+        if version:
+            details["version"] = version
+
+        released = get_next_value(lines, "Released")
+        if released:
+            details["released"] = released
 
     except requests.RequestException as error:
         print(f"No se pudieron cargar los detalles de {mod['name']}: {error}")
@@ -134,43 +165,44 @@ def get_mod_details(mod):
 def send_discord_message(mod):
     details = get_mod_details(mod)
 
+    # Construimos el texto del cuerpo igual al formato exacto de tu captura
+    desc_lines = [
+        f"**Name:** {mod['name']}",
+        f"**Game:** {details['game']}"
+    ]
+
+    if details["manufacturer"]:
+        desc_lines.append(f"**Manufacturer:** {details['manufacturer']}")
+
+    desc_lines.append(f"**Category:** {details['category']}")
+    desc_lines.append(f"**Author:** {details['author']}")
+
+    if details["size"]:
+        desc_lines.append(f"**Size:** {details['size']}")
+
+    desc_lines.append(f"**Version:** {details['version']}")
+
+    if details["released"]:
+        desc_lines.append(f"**Released:** {details['released']}")
+
+    desc_lines.append(f"**Platform:** {details['platform']}")
+    desc_lines.append(f"**Link:** [View Mod]({mod['url']})")
+
+    description_text = "\n".join(desc_lines)
+
     embed = {
-        "title": f"🚜 {mod['name']}",
+        "title": "25 ModHub - New Mod!",
         "url": mod["url"],
-        "description": (
-            "**Nuevo mod disponible en Farming Simulator 25**\n"
-            "Publicado en el ModHub oficial."
-        ),
+        "description": description_text,
         "color": FS_GREEN,
-        "fields": [],
-        "footer": {
-            "text": "FS25 ModHub • Catálogo de novedades"
+        "thumbnail": {
+            "url": ICON_25_URL
         },
+        "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
-    if details["author"]:
-        embed["fields"].append({
-            "name": "👤 Autor",
-            "value": details["author"][:1024],
-            "inline": True,
-        })
-
-    if details["category"]:
-        embed["fields"].append({
-            "name": "📁 Categoría",
-            "value": details["category"][:1024],
-            "inline": True,
-        })
-
-    if details["platform"]:
-        embed["fields"].append({
-            "name": "🎮 Plataformas",
-            "value": details["platform"][:1024],
-            "inline": False,
-        })
-
     if details["image"]:
-        embed["thumbnail"] = {"url": details["image"]}
+        embed["image"] = {"url": details["image"]}
 
     payload = {
         "embeds": [embed],
@@ -195,7 +227,6 @@ def save_state(seen):
 def main():
     mods = get_mods()
 
-    # Primera ejecución: registrar el estado actual sin enviar avisos.
     if not STATE.exists():
         save_state(mods)
         print(f"Configuración inicial: {len(mods)} mods registrados.")
@@ -204,7 +235,6 @@ def main():
     with STATE.open("r", encoding="utf-8") as file:
         seen = json.load(file)
 
-    # Compatibilidad con versiones anteriores de seen.json.
     if isinstance(seen, list):
         seen = {str(item): {} for item in seen}
 
@@ -215,7 +245,6 @@ def main():
     else:
         print(f"Mods nuevos detectados: {len(new_ids)}")
 
-    # Publicar hasta 10 mods por ejecución.
     for mod_id in new_ids[:MAX_NEW_MODS]:
         mod = mods[mod_id]
 
@@ -229,7 +258,6 @@ def main():
         save_state(seen)
         print(f"Publicado: {mod['name']}")
 
-    # Actualizar los datos de los mods conocidos.
     for mod_id, mod in mods.items():
         if mod_id in seen:
             seen[mod_id] = {**seen[mod_id], **mod}
