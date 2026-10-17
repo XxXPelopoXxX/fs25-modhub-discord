@@ -94,7 +94,7 @@ def get_next_value(lines, label):
 
 
 def get_mod_details(mod):
-    """Obtiene todos los atributos detallados de la ficha del mod."""
+    """Obtiene los atributos detallados y la imagen real del mod evitando la genérica."""
     details = {
         "author": "N/A",
         "category": "N/A",
@@ -110,18 +110,38 @@ def get_mod_details(mod):
     try:
         soup = get_soup(mod["url"])
 
-        # Imagen principal (OG / Twitter metadata)
-        for attribute in (
-            {"property": "og:image"},
-            {"name": "twitter:image"},
-        ):
-            meta = soup.find("meta", attrs=attribute)
-            if meta and meta.get("content"):
-                details["image"] = urljoin(
-                    mod["url"], meta["content"]
-                )
-                break
+        # Intentar buscar la imagen real del mod dentro de la galería o contenedor de imágenes de la ficha
+        mod_image = None
+        
+        # En el ModHub, la imagen grande del mod suele estar en un contenedor específico (ej. etiqueta img con clase o dentro de un visor)
+        # Buscamos primero imágenes dentro del contenido principal del mod que no sean banners genéricos
+        for img in soup.find_all("img", src=True):
+            src = img["src"]
+            # Filtramos para buscar imágenes que pertenezcan al CDN de mods y no sean iconos o logos genéricos
+            if "modhub" in src or "dlc" in src or "storage" in src:
+                if "default" not in src and "share" not in src and "logo" not in src:
+                    mod_image = urljoin(mod["url"], src)
+                    break
 
+        # Si no encontramos una específica en el cuerpo, probamos con las metatags pero validando que no sea la genérica
+        if not mod_image:
+            for attribute in (
+                {"property": "og:image"},
+                {"name": "twitter:image"},
+            ):
+                meta = soup.find("meta", attrs=attribute)
+                if meta and meta.get("content"):
+                    content_url = meta["content"]
+                    # Si la meta imagen no es la genérica de farming-simulator.com por defecto
+                    if "default" not in content_url and "sharing" not in content_url:
+                        mod_image = urljoin(mod["url"], content_url)
+                        break
+
+        # Si se encontró una imagen válida del mod, la actualizamos
+        if mod_image:
+            details["image"] = mod_image
+
+        # Extraer los textos de las etiquetas de la ficha
         lines = [
             line.strip()
             for line in soup.get_text("\n").splitlines()
@@ -160,7 +180,6 @@ def get_mod_details(mod):
         print(f"No se pudieron cargar los detalles de {mod['name']}: {error}")
 
     return details
-
 
 def send_discord_message(mod):
     details = get_mod_details(mod)
