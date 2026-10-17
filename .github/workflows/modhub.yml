@@ -32,6 +32,13 @@ jobs:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         run: python monitor.py
 
+      - name: Test Discord webhook
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          python -c "import os, requests; r=requests.post(os.environ['DISCORD_WEBHOOK'], json={'content':'✅ Prueba de conexión: el webhook de FS25 funciona.'}, timeout=20); r.raise_for_status(); print('Discord respondió:', r.status_code)"
+
       - name: Save detected mods
         run: |
           git config user.name "github-actions[bot]"
