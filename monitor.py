@@ -1,10 +1,8 @@
-python
-
 import os
 import json
 import re
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, parse_qs
 
 import requests
 from bs4 import BeautifulSoup
@@ -13,65 +11,86 @@ SOURCE = "https://www.farming-simulator.com/mods.php?filter=latest"
 STATE = Path("seen.json")
 WEBHOOK = os.environ["DISCORD_WEBHOOK"]
 
-headers = {
-    "User-Agent": "FS25-ModHub-Discord-Monitor/1.0"
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; FS25ModHubMonitor/1.0)"
 }
 
-response = requests.get(SOURCE, headers=headers, timeout=30)
-response.raise_for_status()
-soup = BeautifulSoup(response.text, "html.parser")
 
-# Buscar enlaces a fichas de mods del ModHub.
-mods = {}
-for link in soup.find_all("a", href=True):
-    href = link["href"]
-    if "mod.php" not in href or "MORE INFO" not in link.get_text(" ", strip=True).upper():
-        continue
+def get_mods():
+    response = requests.get(SOURCE, headers=HEADERS, timeout=30)
+    response.raise_for_status()
+    soup = BeautifulSoup(response.text, "html.parser")
+    mods = {}
 
-    card = link
-    for _ in range(6):
-        if card.parent is None:
-            break
-        card = card.parent
-        if card.find(["h2", "h3", "h4"]):
-            break
+    for link in soup.find_all("a", href=True):
+        href = link["href"]
+        parsed = urlparse(urljoin(SOURCE, href))
 
-    heading = card.find(["h2", "h3", "h4"])
-    if not heading:
-        continue
+        if not parsed.path.endswith("/mod.php"):
+            continue
 
-    name = heading.get_text(" ", strip=True)
-    url = urljoin(SOURCE, href)
+        params = parse_qs(parsed.query)
+        mod_id = params.get("mod_id", [None])[0]
+        if not mod_id:
+            continue
 
-    # Solo fichas identificables del juego FS25.
-    if name and re.search(r"mod\.php", url):
-        mods[url] = name
+        card = link
+        for _ in range(6):
+            if card.parent is None:
+                break
+            card = card.parent
+            if card.find(["h2", "h3", "h4"]):
+                break
 
-if not mods:
-    raise RuntimeError(
-        "No se detectaron mods. La estructura de la página "
-        "puede haber cambiado; no se enviará ningún mensaje."
-    )
+        heading = card.find(["h2", "h3", "h4"])
+        if not heading:
+            continue
 
-seen = json.loads(STATE.read_text()) if STATE.exists() else None
+        name = heading.get_text(" ", strip=True)
+        url = urljoin(SOURCE, href)
+        mods[mod_id] = {"name": name, "url": url}
 
-# Primera ejecución: registrar lo encontrado sin inundar Discord.
-if seen is None:
-    STATE.write_text(json.dumps(list(mods.keys()), indent=2))
-    print(f"Configuración inicial: registrados {len(mods)} mods.")
-else:
-    known = set(seen)
-    new_mods = [(url, name) for url, name in mods.items()
-                if url not in known]
+    if not mods:
+        raise RuntimeError(
+            "No se detectaron fichas de mods. "
+            "Hay que revisar el HTML actual del ModHub."
+        )
 
-    # Limitar avisos por ejecución.
-    for url, name in new_mods[:10]:
+    return mods
+
+
+def main():
+    mods = get_mods()
+    seen = json.loads(STATE.read_text()) if STATE.exists() else None
+
+    # Primera ejecución: guardar el catálogo inicial sin enviar mensajes.
+    if seen is None:
+        STATE.write_text(json.dumps(mods, indent=2))
+        print(f"Configuración inicial: {len(mods)} mods registrados.")
+        return
+
+    # Compatibilidad con el formato guardado en ejecuciones anteriores.
+    if isinstance(seen, list):
+        seen = {str(item): {} for item in seen}
+
+    new_ids = [mod_id for mod_id in mods if mod_id not in seen]
+
+    for mod_id in new_ids[:10]:
+        mod = mods[mod_id]
         message = {
-            "content": f"🆕 **Nuevo mod de FS25: {name}**\n{url}"
+            "content": (
+                f"🆕 **Nuevo mod de FS25: {mod['name']}**\n"
+                f"{mod['url']}"
+            )
         }
         result = requests.post(WEBHOOK, json=message, timeout=20)
         result.raise_for_status()
+        print(f"Publicado: {mod['name']}")
 
-    updated = list(dict.fromkeys(list(mods.keys()) + list(seen)))[:1000]
-    STATE.write_text(json.dumps(updated, indent=2))
-    print(f"Mods nuevos publicados: {min(len(new_mods), 10)}")
+    # Guardar los mods detectados para no repetir los avisos.
+    seen.update(mods)
+    STATE.write_text(json.dumps(seen, indent=2))
+
+
+if __name__ == "__main__":
+    main()
