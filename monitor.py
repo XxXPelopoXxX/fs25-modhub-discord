@@ -11,15 +11,11 @@ SOURCE = "https://www.farming-simulator.com/mods.php?filter=latest"
 STATE = Path("seen.json")
 WEBHOOK = os.environ["DISCORD_WEBHOOK"]
 
-# Configura FS25_LOGO_URL como variable de entorno/secreto de GitHub
-# con una URL pública directa a un PNG/JPG cuadrado del logo de FS25.
-FS25_LOGO_URL = os.getenv("FS25_LOGO_URL", "").strip()
-
-GREEN = 0x76B900
+FS_GREEN = 0x76B900
 MAX_NEW_MODS = 10
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; FS25ModHubMonitor/3.1)"
+    "User-Agent": "Mozilla/5.0 (compatible; FS25ModHubMonitor/2.0)"
 }
 
 session = requests.Session()
@@ -32,40 +28,12 @@ def get_soup(url):
     return BeautifulSoup(response.text, "html.parser")
 
 
-def absolute_url(url, base):
-    if not url:
-        return None
-    return urljoin(base, url.strip())
-
-
-def find_mod_image(soup, base_url):
-    for attrs in (
-        {"property": "og:image"},
-        {"name": "twitter:image"},
-    ):
-        tag = soup.find("meta", attrs=attrs)
-        if tag and tag.get("content"):
-            return absolute_url(tag["content"], base_url)
-
-    for img in soup.find_all("img", src=True):
-        description = " ".join([
-            img.get("src", ""),
-            img.get("alt", ""),
-            img.get("title", ""),
-        ]).lower()
-
-        if any(word in description for word in ("preview", "vehicle", "mod")):
-            return absolute_url(img["src"], base_url)
-
-    return None
-
-
 def get_mods():
     soup = get_soup(SOURCE)
     mods = {}
 
     for link in soup.find_all("a", href=True):
-        url = absolute_url(link["href"], SOURCE)
+        url = urljoin(SOURCE, link["href"])
         parsed = urlparse(url)
 
         if not parsed.path.endswith("/mod.php"):
@@ -91,8 +59,10 @@ def get_mods():
         if not name:
             continue
 
-        img = card.find("img", src=True)
-        image_url = absolute_url(img["src"], SOURCE) if img else None
+        image_url = None
+        image = card.find("img", src=True)
+        if image:
+            image_url = urljoin(SOURCE, image["src"])
 
         mods[str(mod_id)] = {
             "name": name,
@@ -102,118 +72,113 @@ def get_mods():
 
     if not mods:
         raise RuntimeError(
-            "No se detectaron mods en el ModHub. "
-            "Puede haber cambiado el HTML de la página."
+            "No se detectaron mods. Revisa el HTML del ModHub."
         )
 
     return mods
 
 
-def extract_details(mod):
+def get_next_value(lines, label):
+    """Busca el valor que aparece después de una etiqueta."""
+    for index, line in enumerate(lines):
+        if line.strip().rstrip(":").lower() == label.lower():
+            for following in lines[index + 1:]:
+                following = following.strip()
+                if following:
+                    return following
+    return None
+
+
+def get_mod_details(mod):
+    """Obtiene autor, categoría, plataformas e imagen de la ficha."""
     details = {
-        "game": "Farming Simulator 25",
-        "manufacturer": None,
-        "category": None,
         "author": None,
-        "size": None,
-        "version": None,
-        "released": None,
+        "category": None,
         "platform": None,
         "image": mod.get("image"),
     }
 
-    soup = get_soup(mod["url"])
-    details["image"] = find_mod_image(soup, mod["url"]) or details["image"]
+    try:
+        soup = get_soup(mod["url"])
 
-    lines = [
-        re.sub(r"\s+", " ", line).strip()
-        for line in soup.get_text("\n").splitlines()
-    ]
-    lines = [line for line in lines if line]
+        # La imagen principal suele estar en los metadatos de la ficha.
+        for attribute in (
+            {"property": "og:image"},
+            {"name": "twitter:image"},
+        ):
+            meta = soup.find("meta", attrs=attribute)
+            if meta and meta.get("content"):
+                details["image"] = urljoin(
+                    mod["url"], meta["content"]
+                )
+                break
 
-    aliases = {
-        "manufacturer": ("Manufacturer", "Brand", "Hersteller"),
-        "category": ("Category", "Kategorie"),
-        "author": ("Author", "Modder", "Autor"),
-        "size": ("Size", "File size", "Größe"),
-        "version": ("Version",),
-        "released": ("Released", "Release date", "Date", "Veröffentlicht"),
-        "platform": ("Platform", "Platforms", "Plattform"),
-    }
+        # Extraer los datos visibles de la página.
+        lines = [
+            line.strip()
+            for line in soup.get_text("\n").splitlines()
+            if line.strip()
+        ]
 
-    for field, labels in aliases.items():
-        for index, line in enumerate(lines):
-            matched_label = next(
-                (
-                    label for label in labels
-                    if line.lower().startswith(label.lower() + ":")
-                ),
-                None,
-            )
+        details["author"] = get_next_value(lines, "Author")
+        details["category"] = get_next_value(lines, "Category")
+        details["platform"] = get_next_value(lines, "Platform")
 
-            if matched_label:
-                value = line.split(":", 1)[1].strip()
-                if value:
-                    details[field] = value
-                    break
-
-            if line.rstrip(":").lower() in {
-                label.lower() for label in labels
-            }:
-                if index + 1 < len(lines):
-                    candidate = lines[index + 1].strip()
-                    if candidate and len(candidate) < 300:
-                        details[field] = candidate
-                        break
+    except requests.RequestException as error:
+        print(f"No se pudieron cargar los detalles de {mod['name']}: {error}")
 
     return details
 
 
 def send_discord_message(mod):
-    details = extract_details(mod)
+    details = get_mod_details(mod)
 
     embed = {
-        "author": {
-            "name": "🟩 ModHub - New Mod!",
-        },
-        "title": details.get("name") or mod["name"],
+        "title": f"🚜 {mod['name']}",
         "url": mod["url"],
-        "color": GREEN,
         "description": (
-            f"**Game:** {details['game']}\n"
-            f"**Manufacturer:** {details['manufacturer'] or 'N/A'}\n"
-            f"**Category:** {details['category'] or 'N/A'}\n"
-            f"**Author:** {details['author'] or 'N/A'}\n"
-            f"**Size:** {details['size'] or 'N/A'}\n"
-            f"**Version:** {details['version'] or 'N/A'}\n"
-            f"**Released:** {details['released'] or 'N/A'}\n"
-            f"**Platform:** {details['platform'] or 'N/A'}"
+            "**Nuevo mod disponible en Farming Simulator 25**\n"
+            "Publicado en el ModHub oficial."
         ),
-        "fields": [
-            {
-                "name": "🔗 Link",
-                "value": f"[View Mod]({mod['url']})",
-                "inline": True,
-            }
-        ],
+        "color": FS_GREEN,
+        "fields": [],
         "footer": {
-            "text": "Farming Simulator 25 • ModHub",
+            "text": "FS25 ModHub • Catálogo de novedades"
         },
     }
 
-    # Logo pequeño arriba a la derecha. La URL debe ser pública y directa.
-    if FS25_LOGO_URL:
-        embed["thumbnail"] = {"url": FS25_LOGO_URL}
+    if details["author"]:
+        embed["fields"].append({
+            "name": "👤 Autor",
+            "value": details["author"][:1024],
+            "inline": True,
+        })
 
-    # No usar embed["image"]: eso genera la imagen grande debajo.
-    # Se conserva solo la miniatura del logo para que el aviso sea compacto.
+    if details["category"]:
+        embed["fields"].append({
+            "name": "📁 Categoría",
+            "value": details["category"][:1024],
+            "inline": True,
+        })
+
+    if details["platform"]:
+        embed["fields"].append({
+            "name": "🎮 Plataformas",
+            "value": details["platform"][:1024],
+            "inline": False,
+        })
+
+    if details["image"]:
+        embed["thumbnail"] = {"url": details["image"]}
+
+    payload = {
+        "embeds": [embed],
+        "allowed_mentions": {"parse": []},
+    }
 
     response = session.post(
         WEBHOOK,
-        json={
-            "embeds": [embed],
-            "allowed_mentions": {"parse": []},
-        },
+        json=payload,
         timeout=20,
     )
     response.raise_for_status()
@@ -229,6 +194,7 @@ def save_state(seen):
 def main():
     mods = get_mods()
 
+    # Primera ejecución: registrar el estado actual sin enviar avisos.
     if not STATE.exists():
         save_state(mods)
         print(f"Configuración inicial: {len(mods)} mods registrados.")
@@ -237,6 +203,7 @@ def main():
     with STATE.open("r", encoding="utf-8") as file:
         seen = json.load(file)
 
+    # Compatibilidad con versiones anteriores de seen.json.
     if isinstance(seen, list):
         seen = {str(item): {} for item in seen}
 
@@ -244,13 +211,16 @@ def main():
 
     if not new_ids:
         print("No se han detectado mods nuevos.")
+    else:
+        print(f"Mods nuevos detectados: {len(new_ids)}")
 
+    # Publicar hasta 10 mods por ejecución.
     for mod_id in new_ids[:MAX_NEW_MODS]:
         mod = mods[mod_id]
 
         try:
             send_discord_message(mod)
-        except (requests.RequestException, ValueError) as error:
+        except requests.RequestException as error:
             print(f"Error al publicar {mod['name']}: {error}")
             break
 
@@ -258,12 +228,10 @@ def main():
         save_state(seen)
         print(f"Publicado: {mod['name']}")
 
+    # Actualizar los datos de los mods conocidos.
     for mod_id, mod in mods.items():
         if mod_id in seen:
-            previous = seen[mod_id]
-            if not isinstance(previous, dict):
-                previous = {}
-            seen[mod_id] = {**previous, **mod}
+            seen[mod_id] = {**seen[mod_id], **mod}
 
     save_state(seen)
 
