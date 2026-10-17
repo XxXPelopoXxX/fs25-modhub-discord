@@ -16,7 +16,7 @@ FS_GREEN = 0x76B900
 MAX_NEW_MODS = 10
 
 # URL del icono verde "25" que aparece arriba a la derecha como Thumbnail
-ICON_25_URL = "https://cdn.farming-simulator.com/favicon.ico" # O la URL directa del logo verde de FS25
+ICON_25_URL = "https://cdn.farming-simulator.com/favicon.ico"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; FS25ModHubMonitor/2.0)"
@@ -94,7 +94,7 @@ def get_next_value(lines, label):
 
 
 def get_mod_details(mod):
-    """Obtiene los atributos detallados y la imagen real del mod evitando la genérica."""
+    """Obtiene todos los atributos detallados y asegura la imagen correcta del mod."""
     details = {
         "author": "N/A",
         "category": "N/A",
@@ -104,42 +104,25 @@ def get_mod_details(mod):
         "version": "1.0.0.0",
         "released": None,
         "game": "Farming Simulator 25",
-        "image": mod.get("image"),
+        "image": mod.get("image"),  # Empezamos usando la que capturó del listado principal
     }
 
     try:
         soup = get_soup(mod["url"])
 
-        # Intentar buscar la imagen real del mod dentro de la galería o contenedor de imágenes de la ficha
-        mod_image = None
-        
-        # En el ModHub, la imagen grande del mod suele estar en un contenedor específico (ej. etiqueta img con clase o dentro de un visor)
-        # Buscamos primero imágenes dentro del contenido principal del mod que no sean banners genéricos
+        # Si la imagen del listado no existe o queremos afinar, buscamos imágenes grandes en la ficha
+        # Excluimos cabeceras genéricas, logos y avatares buscando patrones de imágenes de productos/mods
+        ficha_image = None
         for img in soup.find_all("img", src=True):
             src = img["src"]
-            # Filtramos para buscar imágenes que pertenezcan al CDN de mods y no sean iconos o logos genéricos
-            if "modhub" in src or "dlc" in src or "storage" in src:
-                if "default" not in src and "share" not in src and "logo" not in src:
-                    mod_image = urljoin(mod["url"], src)
+            # Las imágenes de los mods en el ModHub suelen tener rutas específicas de almacenamiento o contenido multimedia
+            if any(term in src.lower() for term in ["storage", "mods", "dlc", "media", "upload"]):
+                if not any(excluded in src.lower() for excluded in ["default", "sharing", "logo", "icon", "avatar", "share"]):
+                    ficha_image = urljoin(mod["url"], src)
                     break
-
-        # Si no encontramos una específica en el cuerpo, probamos con las metatags pero validando que no sea la genérica
-        if not mod_image:
-            for attribute in (
-                {"property": "og:image"},
-                {"name": "twitter:image"},
-            ):
-                meta = soup.find("meta", attrs=attribute)
-                if meta and meta.get("content"):
-                    content_url = meta["content"]
-                    # Si la meta imagen no es la genérica de farming-simulator.com por defecto
-                    if "default" not in content_url and "sharing" not in content_url:
-                        mod_image = urljoin(mod["url"], content_url)
-                        break
-
-        # Si se encontró una imagen válida del mod, la actualizamos
-        if mod_image:
-            details["image"] = mod_image
+        
+        if ficha_image:
+            details["image"] = ficha_image
 
         # Extraer los textos de las etiquetas de la ficha
         lines = [
@@ -181,10 +164,11 @@ def get_mod_details(mod):
 
     return details
 
+
 def send_discord_message(mod):
     details = get_mod_details(mod)
 
-    # Construimos el texto del cuerpo igual al formato exacto de tu captura
+    # Construimos el texto del cuerpo con el diseño exacto
     desc_lines = [
         f"**Name:** {mod['name']}",
         f"**Game:** {details['game']}"
