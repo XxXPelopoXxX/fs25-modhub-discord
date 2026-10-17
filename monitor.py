@@ -11,15 +11,15 @@ SOURCE = "https://www.farming-simulator.com/mods.php?filter=latest"
 STATE = Path("seen.json")
 WEBHOOK = os.environ["DISCORD_WEBHOOK"]
 
-# Opcional: URL directa del logo cuadrado de FS25.
-# Si no se configura, intentaremos encontrarlo en la web oficial.
+# Configura FS25_LOGO_URL como variable de entorno/secreto de GitHub
+# con una URL pública directa a un PNG/JPG cuadrado del logo de FS25.
 FS25_LOGO_URL = os.getenv("FS25_LOGO_URL", "").strip()
 
 GREEN = 0x76B900
 MAX_NEW_MODS = 10
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; FS25ModHubMonitor/3.0)"
+    "User-Agent": "Mozilla/5.0 (compatible; FS25ModHubMonitor/3.1)"
 }
 
 session = requests.Session()
@@ -39,7 +39,6 @@ def absolute_url(url, base):
 
 
 def find_mod_image(soup, base_url):
-    # Preferir la imagen oficial de la ficha del mod.
     for attrs in (
         {"property": "og:image"},
         {"name": "twitter:image"},
@@ -48,35 +47,15 @@ def find_mod_image(soup, base_url):
         if tag and tag.get("content"):
             return absolute_url(tag["content"], base_url)
 
-    # Como alternativa, buscar imágenes de la propia ficha.
     for img in soup.find_all("img", src=True):
-        src = img.get("src", "")
-        alt = img.get("alt", "").lower()
-
-        if any(word in alt for word in ("preview", "mod", "vehicle")):
-            return absolute_url(src, base_url)
-
-    return None
-
-
-def find_fs25_logo(soup):
-    if FS25_LOGO_URL:
-        return FS25_LOGO_URL
-
-    # Intentar detectar un logo del juego en la página oficial.
-    for img in soup.find_all("img", src=True):
-        src = img.get("src", "")
         description = " ".join([
-            src,
+            img.get("src", ""),
             img.get("alt", ""),
             img.get("title", ""),
         ]).lower()
 
-        if (
-            ("fs25" in description or "farming-simulator-25" in description)
-            and ("logo" in description or "icon" in description)
-        ):
-            return absolute_url(src, SOURCE)
+        if any(word in description for word in ("preview", "vehicle", "mod")):
+            return absolute_url(img["src"], base_url)
 
     return None
 
@@ -112,10 +91,8 @@ def get_mods():
         if not name:
             continue
 
-        image_url = None
         img = card.find("img", src=True)
-        if img:
-            image_url = absolute_url(img["src"], SOURCE)
+        image_url = absolute_url(img["src"], SOURCE) if img else None
 
         mods[str(mod_id)] = {
             "name": name,
@@ -129,7 +106,7 @@ def get_mods():
             "Puede haber cambiado el HTML de la página."
         )
 
-    return mods, find_fs25_logo(soup)
+    return mods
 
 
 def extract_details(mod):
@@ -146,10 +123,8 @@ def extract_details(mod):
     }
 
     soup = get_soup(mod["url"])
-
     details["image"] = find_mod_image(soup, mod["url"]) or details["image"]
 
-    # Recoger texto visible para buscar las etiquetas de la ficha.
     lines = [
         re.sub(r"\s+", " ", line).strip()
         for line in soup.get_text("\n").splitlines()
@@ -157,17 +132,15 @@ def extract_details(mod):
     lines = [line for line in lines if line]
 
     aliases = {
-        "manufacturer": ("Manufacturer", "Brand"),
-        "category": ("Category",),
-        "author": ("Author", "Modder"),
-        "size": ("Size", "File size"),
+        "manufacturer": ("Manufacturer", "Brand", "Hersteller"),
+        "category": ("Category", "Kategorie"),
+        "author": ("Author", "Modder", "Autor"),
+        "size": ("Size", "File size", "Größe"),
         "version": ("Version",),
-        "released": ("Released", "Release date", "Date"),
-        "platform": ("Platform", "Platforms"),
+        "released": ("Released", "Release date", "Date", "Veröffentlicht"),
+        "platform": ("Platform", "Platforms", "Plattform"),
     }
 
-    # Algunas fichas presentan la etiqueta y el valor en líneas separadas;
-    # otras los muestran juntos, por ejemplo "Author: Nombre".
     for field, labels in aliases.items():
         for index, line in enumerate(lines):
             matched_label = next(
@@ -196,65 +169,51 @@ def extract_details(mod):
     return details
 
 
-def add_field(embed, label, value):
-    if value:
-        embed["fields"].append({
-            "name": label,
-            "value": str(value)[:1024],
-            "inline": False,
-        })
-
-
-def send_discord_message(mod, logo_url):
+def send_discord_message(mod):
     details = extract_details(mod)
 
-    # La tarjeta principal reproduce el estilo de tu captura.
     embed = {
         "author": {
-            "name": "ModHub - New Mod!",
-            **({"icon_url": logo_url} if logo_url else {}),
+            "name": "🟩 ModHub - New Mod!",
         },
         "title": details.get("name") or mod["name"],
         "url": mod["url"],
         "color": GREEN,
-        "fields": [],
+        "description": (
+            f"**Game:** {details['game']}\n"
+            f"**Manufacturer:** {details['manufacturer'] or 'N/A'}\n"
+            f"**Category:** {details['category'] or 'N/A'}\n"
+            f"**Author:** {details['author'] or 'N/A'}\n"
+            f"**Size:** {details['size'] or 'N/A'}\n"
+            f"**Version:** {details['version'] or 'N/A'}\n"
+            f"**Released:** {details['released'] or 'N/A'}\n"
+            f"**Platform:** {details['platform'] or 'N/A'}"
+        ),
+        "fields": [
+            {
+                "name": "🔗 Link",
+                "value": f"[View Mod]({mod['url']})",
+                "inline": True,
+            }
+        ],
         "footer": {
-            "text": "Farming Simulator 25 • ModHub oficial",
+            "text": "Farming Simulator 25 • ModHub",
         },
     }
 
-    add_field(embed, "Game", details["game"])
-    add_field(embed, "Manufacturer", details["manufacturer"])
-    add_field(embed, "Category", details["category"])
-    add_field(embed, "Author", details["author"])
-    add_field(embed, "Size", details["size"])
-    add_field(embed, "Version", details["version"])
-    add_field(embed, "Released", details["released"])
-    add_field(embed, "Platform", details["platform"])
+    # Logo pequeño arriba a la derecha. La URL debe ser pública y directa.
+    if FS25_LOGO_URL:
+        embed["thumbnail"] = {"url": FS25_LOGO_URL}
 
-    # Imagen pequeña arriba a la derecha.
-    if logo_url:
-        embed["thumbnail"] = {"url": logo_url}
-
-    # Imagen grande del mod debajo de los campos.
-    if details["image"]:
-        embed["image"] = {"url": details["image"]}
-
-    # Enlace clicable equivalente a "View Mod".
-    embed["fields"].append({
-        "name": "Link",
-        "value": f"[View Mod]({mod['url']})",
-        "inline": False,
-    })
-
-    payload = {
-        "embeds": [embed],
-        "allowed_mentions": {"parse": []},
-    }
+    # No usar embed["image"]: eso genera la imagen grande debajo.
+    # Se conserva solo la miniatura del logo para que el aviso sea compacto.
 
     response = session.post(
         WEBHOOK,
-        json=payload,
+        json={
+            "embeds": [embed],
+            "allowed_mentions": {"parse": []},
+        },
         timeout=20,
     )
     response.raise_for_status()
@@ -268,7 +227,7 @@ def save_state(seen):
 
 
 def main():
-    mods, logo_url = get_mods()
+    mods = get_mods()
 
     if not STATE.exists():
         save_state(mods)
@@ -290,7 +249,7 @@ def main():
         mod = mods[mod_id]
 
         try:
-            send_discord_message(mod, logo_url)
+            send_discord_message(mod)
         except (requests.RequestException, ValueError) as error:
             print(f"Error al publicar {mod['name']}: {error}")
             break
@@ -299,7 +258,6 @@ def main():
         save_state(seen)
         print(f"Publicado: {mod['name']}")
 
-    # Actualizar los datos conocidos sin volver a anunciar los mods.
     for mod_id, mod in mods.items():
         if mod_id in seen:
             previous = seen[mod_id]
