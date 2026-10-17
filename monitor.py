@@ -40,7 +40,7 @@ def meta_content(soup, *selectors):
 
 
 def get_mod_details(mod):
-    """Obtiene detalles adicionales sin impedir el envío si falla."""
+    """Obtiene imagen, descripción y autor de la ficha del mod."""
     details = {
         "image": mod.get("image"),
         "description": None,
@@ -50,7 +50,7 @@ def get_mod_details(mod):
     try:
         soup = BeautifulSoup(get_page(mod["url"]), "html.parser")
 
-        # Imagen principal oficial de la ficha.
+        # Imagen oficial de la ficha.
         image = meta_content(
             soup,
             'meta[property="og:image"]',
@@ -60,16 +60,17 @@ def get_mod_details(mod):
         if image:
             details["image"] = urljoin(mod["url"], image)
 
-        # Descripción para el embed.
+        # Descripción de la página.
         details["description"] = meta_content(
             soup,
             'meta[property="og:description"]',
             'meta[name="description"]',
         )
 
-        # Buscar el autor en el texto de la ficha.
+        # Intento de encontrar el autor en el texto.
         if not details["author"]:
             text = soup.get_text(" ", strip=True)
+
             match = re.search(
                 r"\b(?:By|Por|Von|Par)\s*:\s*(.{2,100}?)"
                 r"(?=\s+(?:MORE INFO|MODHUB|DOWNLOAD|"
@@ -77,16 +78,20 @@ def get_mod_details(mod):
                 text,
                 re.IGNORECASE,
             )
+
             if match:
                 details["author"] = match.group(1).strip(" |,-")
 
     except (requests.RequestException, ValueError) as error:
-        print(f"No se pudieron ampliar los datos de "
-              f"{mod['name']}: {error}")
+        print(
+            f"No se pudieron obtener detalles de "
+            f"{mod['name']}: {error}"
+        )
 
-    # Discord necesita imágenes accesibles por HTTPS.
+    # Discord necesita una URL válida para la miniatura.
     if details["image"]:
         parsed_image = urlparse(details["image"])
+
         if parsed_image.scheme != "https":
             details["image"] = None
 
@@ -105,51 +110,44 @@ def get_mods():
             continue
 
         mod_id = parse_qs(parsed.query).get("mod_id", [None])[0]
+
         if not mod_id:
             continue
 
         card = link
 
+        # Buscar el contenedor que incluye el nombre del mod.
         for _ in range(6):
             if card.parent is None:
                 break
+
             card = card.parent
+
             if card.find(["h2", "h3", "h4"]):
                 break
 
         heading = card.find(["h2", "h3", "h4"])
+
         if not heading:
             continue
 
         name = heading.get_text(" ", strip=True)
+
         if not name:
             continue
 
+        # Intentar obtener una miniatura desde el listado.
         image = None
         img = card.find("img", src=True)
 
         if img:
             image = urljoin(SOURCE, img["src"])
 
-        # Intentar recuperar el autor visible en la tarjeta.
-        author = None
-        card_text = card.get_text(" ", strip=True)
-
-        match = re.search(
-            r"\b(?:By|Por|Von|Par)\s*:\s*(.{2,100}?)"
-            r"(?=\s+\d(?:[.,]\d)?\s*\(|$)",
-            card_text,
-            re.IGNORECASE,
-        )
-
-        if match:
-            author = match.group(1).strip(" |,-")
-
         mods[str(mod_id)] = {
             "name": name,
             "url": url,
             "image": image,
-            "author": author,
+            "author": None,
         }
 
     if not mods:
@@ -163,47 +161,42 @@ def get_mods():
 def send_discord_message(mod):
     details = get_mod_details(mod)
 
-    description = details.get("description") or (
-        "Ya disponible en el ModHub oficial de "
-        "Farming Simulator 25."
-    )
+    description = details.get("description") or ""
+    description = description.strip()[:250]
 
-    # Evitar exceder el límite de descripción de Discord.
-    description = description[:4000]
-
+    # Diseño compacto de Discord.
     embed = {
         "title": f"🚜 {mod['name']}"[:256],
         "url": mod["url"],
-        "description": description,
         "color": EMBED_COLOR,
-        "fields": [
-            {
-                "name": "🎮 Juego",
-                "value": "Farming Simulator 25",
-                "inline": True,
-            },
-        ],
         "footer": {
-            "text": "FS25 ModHub • Nueva publicación",
+            "text": "FS25 ModHub"
         },
     }
 
+    if description:
+        embed["description"] = description
+
     author = details.get("author")
+
     if author:
-        embed["fields"].append({
-            "name": "👤 Autor",
-            "value": author[:1024],
-            "inline": True,
-        })
+        embed["author"] = {
+            "name": f"👤 {author}"[:256]
+        }
 
     image = details.get("image")
+
     if image:
-        embed["image"] = {"url": image}
+        embed["thumbnail"] = {
+            "url": image
+        }
 
     payload = {
-        "content": "🆕 **¡Nuevo mod disponible!**",
+        "content": "🆕 **Nuevo mod disponible para Farming Simulator 25**",
         "embeds": [embed],
-        "allowed_mentions": {"parse": []},
+        "allowed_mentions": {
+            "parse": []
+        },
     }
 
     response = session.post(
@@ -217,11 +210,14 @@ def send_discord_message(mod):
 def main():
     mods = get_mods()
 
+    # Primera ejecución: registrar el estado inicial sin
+    # publicar todos los mods existentes.
     if not STATE.exists():
         STATE.write_text(
             json.dumps(mods, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
+
         print(
             f"Configuración inicial: {len(mods)} mods registrados."
         )
@@ -230,11 +226,16 @@ def main():
     with STATE.open("r", encoding="utf-8") as file:
         seen = json.load(file)
 
+    # Compatibilidad con el formato antiguo de seen.json.
     if isinstance(seen, list):
-        seen = {str(item): {} for item in seen}
+        seen = {
+            str(item): {}
+            for item in seen
+        }
 
     new_ids = [
-        mod_id for mod_id in mods
+        mod_id
+        for mod_id in mods
         if mod_id not in seen
     ]
 
@@ -244,17 +245,22 @@ def main():
 
     print(f"Mods nuevos detectados: {len(new_ids)}")
 
+    # Procesar un máximo de 10 mods por ejecución.
     for mod_id in new_ids[:MAX_MODS_PER_RUN]:
         mod = mods[mod_id]
 
         try:
             send_discord_message(mod)
+
         except requests.RequestException as error:
-            print(f"Error al publicar {mod['name']}: {error}")
+            print(
+                f"Error al publicar {mod['name']}: {error}"
+            )
             break
 
-        # Registrar solo después de confirmar el envío.
+        # Registrar el mod solo después del envío confirmado.
         seen[mod_id] = mod
+
         STATE.write_text(
             json.dumps(seen, indent=2, ensure_ascii=False),
             encoding="utf-8",
@@ -262,13 +268,19 @@ def main():
 
         print(f"Publicado: {mod['name']}")
 
-    # Actualizar los datos conocidos sin anunciar mods antiguos.
+    # Actualizar los datos de mods conocidos sin volver
+    # a anunciarlos como nuevas publicaciones.
     for mod_id, mod in mods.items():
         if mod_id in seen:
-            seen[mod_id] = {
-                **seen[mod_id],
-                **mod,
-            }
+            previous = seen[mod_id]
+
+            if isinstance(previous, dict):
+                seen[mod_id] = {
+                    **previous,
+                    **mod,
+                }
+            else:
+                seen[mod_id] = mod
 
     STATE.write_text(
         json.dumps(seen, indent=2, ensure_ascii=False),
@@ -278,3 +290,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
