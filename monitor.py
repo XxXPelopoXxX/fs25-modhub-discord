@@ -1,5 +1,7 @@
+
 import os
 import json
+import re
 from pathlib import Path
 from urllib.parse import urljoin, urlparse, parse_qs
 
@@ -14,16 +16,85 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; FS25ModHubMonitor/1.0)"
 }
 
+MAX_MODS_PER_RUN = 10
+EMBED_COLOR = 0x43B581
+
+session = requests.Session()
+session.headers.update(HEADERS)
+
+
+def get_page(url):
+    response = session.get(url, timeout=30)
+    response.raise_for_status()
+    return response.text
+
+
+def meta_content(soup, *selectors):
+    for selector in selectors:
+        tag = soup.select_one(selector)
+        if tag:
+            value = tag.get("content", "").strip()
+            if value:
+                return value
+    return None
+
+
+def get_mod_details(mod):
+    """Obtiene detalles adicionales sin impedir el envío si falla."""
+    details = {
+        "image": mod.get("image"),
+        "description": None,
+        "author": mod.get("author"),
+    }
+
+    try:
+        soup = BeautifulSoup(get_page(mod["url"]), "html.parser")
+
+        # Imagen principal oficial de la ficha.
+        image = meta_content(
+            soup,
+            'meta[property="og:image"]',
+            'meta[name="twitter:image"]',
+        )
+
+        if image:
+            details["image"] = urljoin(mod["url"], image)
+
+        # Descripción para el embed.
+        details["description"] = meta_content(
+            soup,
+            'meta[property="og:description"]',
+            'meta[name="description"]',
+        )
+
+        # Buscar el autor en el texto de la ficha.
+        if not details["author"]:
+            text = soup.get_text(" ", strip=True)
+            match = re.search(
+                r"\b(?:By|Por|Von|Par)\s*:\s*(.{2,100}?)"
+                r"(?=\s+(?:MORE INFO|MODHUB|DOWNLOAD|"
+                r"Farming Simulator|Category|Categoría)\b|$)",
+                text,
+                re.IGNORECASE,
+            )
+            if match:
+                details["author"] = match.group(1).strip(" |,-")
+
+    except (requests.RequestException, ValueError) as error:
+        print(f"No se pudieron ampliar los datos de "
+              f"{mod['name']}: {error}")
+
+    # Discord necesita imágenes accesibles por HTTPS.
+    if details["image"]:
+        parsed_image = urlparse(details["image"])
+        if parsed_image.scheme != "https":
+            details["image"] = None
+
+    return details
+
 
 def get_mods():
-    response = requests.get(
-        SOURCE,
-        headers=HEADERS,
-        timeout=30
-    )
-    response.raise_for_status()
-
-    soup = BeautifulSoup(response.text, "html.parser")
+    soup = BeautifulSoup(get_page(SOURCE), "html.parser")
     mods = {}
 
     for link in soup.find_all("a", href=True):
@@ -38,6 +109,7 @@ def get_mods():
             continue
 
         card = link
+
         for _ in range(6):
             if card.parent is None:
                 break
@@ -50,11 +122,35 @@ def get_mods():
             continue
 
         name = heading.get_text(" ", strip=True)
-        if name:
-            mods[str(mod_id)] = {
-                "name": name,
-                "url": url
-            }
+        if not name:
+            continue
+
+        image = None
+        img = card.find("img", src=True)
+
+        if img:
+            image = urljoin(SOURCE, img["src"])
+
+        # Intentar recuperar el autor visible en la tarjeta.
+        author = None
+        card_text = card.get_text(" ", strip=True)
+
+        match = re.search(
+            r"\b(?:By|Por|Von|Par)\s*:\s*(.{2,100}?)"
+            r"(?=\s+\d(?:[.,]\d)?\s*\(|$)",
+            card_text,
+            re.IGNORECASE,
+        )
+
+        if match:
+            author = match.group(1).strip(" |,-")
+
+        mods[str(mod_id)] = {
+            "name": name,
+            "url": url,
+            "image": image,
+            "author": author,
+        }
 
     if not mods:
         raise RuntimeError(
@@ -65,20 +161,55 @@ def get_mods():
 
 
 def send_discord_message(mod):
-    payload = {
-        "content": (
-            "🆕 **¡Nuevo mod de Farming Simulator 25!**\n"
-            f"🚜 **{mod['name']}**\n"
-            f"🔗 [Ver y descargar en el ModHub oficial]"
-            f"({mod['url']})"
-        ),
-        "allowed_mentions": {"parse": []}
+    details = get_mod_details(mod)
+
+    description = details.get("description") or (
+        "Ya disponible en el ModHub oficial de "
+        "Farming Simulator 25."
+    )
+
+    # Evitar exceder el límite de descripción de Discord.
+    description = description[:4000]
+
+    embed = {
+        "title": f"🚜 {mod['name']}"[:256],
+        "url": mod["url"],
+        "description": description,
+        "color": EMBED_COLOR,
+        "fields": [
+            {
+                "name": "🎮 Juego",
+                "value": "Farming Simulator 25",
+                "inline": True,
+            },
+        ],
+        "footer": {
+            "text": "FS25 ModHub • Nueva publicación",
+        },
     }
 
-    response = requests.post(
+    author = details.get("author")
+    if author:
+        embed["fields"].append({
+            "name": "👤 Autor",
+            "value": author[:1024],
+            "inline": True,
+        })
+
+    image = details.get("image")
+    if image:
+        embed["image"] = {"url": image}
+
+    payload = {
+        "content": "🆕 **¡Nuevo mod disponible!**",
+        "embeds": [embed],
+        "allowed_mentions": {"parse": []},
+    }
+
+    response = session.post(
         WEBHOOK,
         json=payload,
-        timeout=20
+        timeout=20,
     )
     response.raise_for_status()
 
@@ -89,9 +220,11 @@ def main():
     if not STATE.exists():
         STATE.write_text(
             json.dumps(mods, indent=2, ensure_ascii=False),
-            encoding="utf-8"
+            encoding="utf-8",
         )
-        print(f"Configuración inicial: {len(mods)} mods registrados.")
+        print(
+            f"Configuración inicial: {len(mods)} mods registrados."
+        )
         return
 
     with STATE.open("r", encoding="utf-8") as file:
@@ -100,9 +233,10 @@ def main():
     if isinstance(seen, list):
         seen = {str(item): {} for item in seen}
 
-    # Si una ficha ya estaba registrada, actualizar sus datos.
-    # Los identificadores nuevos se procesan por separado.
-    new_ids = [mod_id for mod_id in mods if mod_id not in seen]
+    new_ids = [
+        mod_id for mod_id in mods
+        if mod_id not in seen
+    ]
 
     if not new_ids:
         print("No se han detectado mods nuevos.")
@@ -110,8 +244,7 @@ def main():
 
     print(f"Mods nuevos detectados: {len(new_ids)}")
 
-    # Procesar un máximo de 10 por ejecución.
-    for mod_id in new_ids[:10]:
+    for mod_id in new_ids[:MAX_MODS_PER_RUN]:
         mod = mods[mod_id]
 
         try:
@@ -120,24 +253,26 @@ def main():
             print(f"Error al publicar {mod['name']}: {error}")
             break
 
-        # Guardar cada envío confirmado inmediatamente.
+        # Registrar solo después de confirmar el envío.
         seen[mod_id] = mod
         STATE.write_text(
             json.dumps(seen, indent=2, ensure_ascii=False),
-            encoding="utf-8"
+            encoding="utf-8",
         )
 
         print(f"Publicado: {mod['name']}")
 
-    # Actualizar datos de los mods que ya conocíamos sin
-    # marcarlos como nuevas publicaciones.
+    # Actualizar los datos conocidos sin anunciar mods antiguos.
     for mod_id, mod in mods.items():
         if mod_id in seen:
-            seen[mod_id] = mod
+            seen[mod_id] = {
+                **seen[mod_id],
+                **mod,
+            }
 
     STATE.write_text(
         json.dumps(seen, indent=2, ensure_ascii=False),
-        encoding="utf-8"
+        encoding="utf-8",
     )
 
 
