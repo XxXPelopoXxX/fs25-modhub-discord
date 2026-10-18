@@ -1,403 +1,325 @@
-import os
-import re
+"""Publica en Discord mods nuevos y actualizaciones de FS25 del ModHub oficial.
+
+V4.1: añade Solo PC / Multiplataforma a los avisos de Discord,
+sin modificar la detección ni el historial de mods.
+"""
+
+import html
+from html.parser import HTMLParser
 import json
-import requests
+import os
 from pathlib import Path
-from datetime import datetime, timedelta, timezone
-from bs4 import BeautifulSoup
+import re
+import sys
+import time
+import uuid
 from urllib.parse import urljoin
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 
-# URL principal de novedades
-SOURCE = "https://www.farming-simulator.com/mods.php?filter=latest"
-STATE = Path("seen.json")
-WEBHOOK = os.getenv("DISCORD_WEBHOOK")
-
-MAX_AGE_DAYS = 7
-MAX_NOTIFICATIONS = 10
-TIMEOUT = 25
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/131.0.0.0 Safari/537.36"
-    )
-}
+BASE = "https://www.farming-simulator.com/"
+LIST = BASE + "mods.php?lang=en&country=es&title=fs2025&filter=latest&page={}"
+STATE = Path(__file__).with_name("seen.json")
+USER_AGENT = "Mozilla/5.0 (compatible; FS25-ModHub-Discord/4.1)"
+MAX_PAGES = 6
 
 
-def get_soup(url):
-    response = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
-    response.raise_for_status()
-    return BeautifulSoup(response.text, "html.parser")
+class ModParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.depth = 0
+        self.item = None
+        self.items = []
+        self.in_title = False
+        self.in_author = False
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        classes = a.get("class", "").split()
+        if tag == "div" and "mod-item" in classes:
+            self.depth = 1
+            self.item = {"title": "", "author": "", "url": "", "image": "", "_all_text": []}
+            return
+        if self.item is None:
+            return
+        if tag == "div":
+            self.depth += 1
+        elif tag == "a" and "mod_id=" in a.get("href", ""):
+            self.item["url"] = urljoin(BASE, a["href"])
+            match = re.search(r"mod_id=(\d+)", a["href"])
+            if match:
+                self.item["id"] = match.group(1)
+        elif tag == "img" and not self.item["image"]:
+            self.item["image"] = urljoin(BASE, a.get("src", ""))
+        elif tag == "h4":
+            self.in_title = True
+        elif tag == "span" and not self.item["author"]:
+            self.in_author = True
+
+    def handle_endtag(self, tag):
+        if self.item is None:
+            return
+        if tag == "h4":
+            self.in_title = False
+        elif tag == "span":
+            self.in_author = False
+        elif tag == "div":
+            self.depth -= 1
+            if self.depth == 0:
+                if self.item.get("id") and self.item["title"] and self.item["image"]:
+                    all_text = " ".join(self.item.pop("_all_text", []))
+                    if re.search(r"UPDATE\s*!", all_text, re.IGNORECASE):
+                        self.item["marker"] = "UPDATE"
+                    elif re.search(r"NEW\s*!", all_text, re.IGNORECASE):
+                        self.item["marker"] = "NEW"
+                    else:
+                        self.item["marker"] = ""
+                    self.items.append(self.item)
+                self.item = None
+
+    def handle_data(self, data):
+        if self.item is not None:
+            clean = " ".join(data.split())
+            if clean:
+                self.item["_all_text"].append(clean)
+            if self.in_title:
+                self.item["title"] += data
+            elif self.in_author:
+                self.item["author"] += data
+
+
+class TextParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.parts = []
+
+    def handle_data(self, data):
+        text = " ".join(data.split())
+        if text:
+            self.parts.append(text)
+
+
+def fetch(url):
+    req = Request(url, headers={"User-Agent": USER_AGENT})
+    with urlopen(req, timeout=30) as response:
+        return response.read().decode("utf-8", "replace")
+
+
+def get_details(mod):
+    parser = TextParser()
+    parser.feed(fetch(mod["url"]))
+    text = "\n".join(parser.parts)
+    patterns = [
+        r"(?:^|\n)Version\s*\n\s*([0-9]+(?:\.[0-9]+)+)(?:\n|$)",
+        r"\bVersion\s*[: ]\s*([0-9]+(?:\.[0-9]+)+)\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            version = match.group(1)
+            break
+    else:
+        raise RuntimeError(f"No pude leer la versión de {mod['title'].strip()} ({mod['id']})")
+
+    # La ficha oficial presenta Platform seguido de PC/MAC y, si procede, consolas.
+    platform_match = re.search(r"(?:^|\n)Platform\s*\n\s*([^\n]+)", text, re.IGNORECASE)
+    if platform_match:
+        platforms = platform_match.group(1).upper()
+        if re.search(r"\b(?:PS5|PS4|XBS|XBOX|S2|SWITCH)\b", platforms):
+            platform = "🎮 Multiplataforma"
+        elif re.search(r"\bPC\s*/\s*MAC\b|\bPC\b", platforms):
+            platform = "🖥️ Solo PC"
+        else:
+            platform = "Plataforma no determinada"
+    else:
+        platform = "Plataforma no determinada"
+    return version, platform
+
+
+def get_mods():
+    mods = []
+    seen_ids = set()
+    for page in range(MAX_PAGES):
+        parser = ModParser()
+        parser.feed(fetch(LIST.format(page)))
+        if not parser.items:
+            break
+        for mod in parser.items:
+            if mod["id"] not in seen_ids:
+                seen_ids.add(mod["id"])
+                mods.append(mod)
+        if len(parser.items) < 10:
+            break
+    if len(mods) < 10:
+        raise RuntimeError(f"ModHub devolvió solo {len(mods)} mods; cancelo para no alterar el estado.")
+    return mods
 
 
 def load_state():
-    """Carga el estado guardado {mod_id: version}."""
     if not STATE.exists():
-        return None
-
-    try:
-        data = json.loads(STATE.read_text(encoding="utf-8"))
-        if isinstance(data, list):
-            return {str(item): "1.0.0.0" for item in data}
-        if isinstance(data, dict):
-            seen_data = data.get("seen", data)
-            if isinstance(seen_data, list):
-                return {str(item): "1.0.0.0" for item in seen_data}
-            if isinstance(seen_data, dict):
-                return {str(k): str(v) for k, v in seen_data.items()}
-    except (json.JSONDecodeError, OSError):
-        print("Aviso: no se pudo leer seen.json. Se iniciará un estado nuevo.")
-
-    return {}
+        return {"format": 3, "legacy_ids": [], "mods": {}}
+    raw = json.loads(STATE.read_text(encoding="utf-8"))
+    if isinstance(raw, list):
+        return {"format": 3, "legacy_ids": raw, "mods": {}}
+    if isinstance(raw, dict) and raw.get("format") in (2, 3):
+        raw["format"] = 3
+        raw.setdefault("legacy_ids", [])
+        raw.setdefault("mods", {})
+        return raw
+    raise RuntimeError("seen.json tiene un formato desconocido")
 
 
-def save_state(seen):
-    """Guarda el diccionario de estados {mod_id: version}."""
+def save_state(state):
+    state["legacy_ids"] = sorted(set(state.get("legacy_ids", [])))
     STATE.write_text(
-        json.dumps({"seen": seen}, ensure_ascii=False, indent=2),
+        json.dumps(state, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
         encoding="utf-8",
     )
 
 
-def get_mods():
-    """Obtiene los mods y prefabs listados en la página de novedades de ModHub."""
-    soup = get_soup(SOURCE)
-    mods = {}
+def send(webhook, mod, event):
+    image_req = Request(mod["image"], headers={"User-Agent": USER_AGENT, "Referer": BASE})
+    with urlopen(image_req, timeout=30) as response:
+        content_type = response.headers.get("Content-Type", "").split(";")[0]
+        if content_type not in ("image/jpeg", "image/png", "image/webp"):
+            raise RuntimeError(f"Imagen inválida para {mod['title'].strip()}: {content_type}")
+        image_bytes = response.read(8_000_001)
+    if len(image_bytes) > 8_000_000 or not image_bytes:
+        raise RuntimeError(f"Imagen demasiado grande o vacía: {mod['title'].strip()}")
 
-    for link in soup.select('a[href*="mod.php?mod_id="]'):
-        href = link.get("href", "")
-        match = re.search(r"mod_id=(\d+)", href)
+    extension = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}[content_type]
+    filename = "modhub." + extension
+    is_update = event == "UPDATE"
+    heading = "🔄 ACTUALIZACIÓN" if is_update else "🆕 NUEVO MOD"
+    footer = (
+        "Actualizado en el ModHub oficial · Farming Simulator 25"
+        if is_update else
+        "Nuevo en el ModHub oficial · Farming Simulator 25"
+    )
+    description = html.unescape(mod["author"].strip())[:400]
+    if mod.get("version"):
+        description += f"\n**Versión:** {mod['version']}"
+    description += f"\n**Plataforma:** {mod.get('platform', 'Plataforma no determinada')}"
 
-        if not match:
-            continue
-
-        mod_id = match.group(1)
-        url = urljoin(SOURCE, href)
-
-        container = link
-        for _ in range(8):
-            if container.parent:
-                container = container.parent
-
-            text = container.get_text(" ", strip=True)
-            image = container.find("img")
-
-            if text and image:
-                break
-
-        name = ""
-        heading = container.find(["h1", "h2", "h3", "h4"])
-
-        if heading:
-            name = heading.get_text(" ", strip=True)
-
-        if not name:
-            name = link.get_text(" ", strip=True)
-
-        if not name:
-            image = container.find("img")
-            if image:
-                name = image.get("alt", "").strip()
-
-        if not name:
-            name = f"Mod {mod_id}"
-
-        image_url = ""
-        image = container.find("img")
-
-        if image:
-            image_url = image.get("src", "")
-            if image_url:
-                image_url = urljoin(SOURCE, image_url)
-
-        mods[mod_id] = {
-            "id": mod_id,
-            "name": name[:250],
-            "url": url,
-            "image": image_url,
-        }
-
-    print(f"Elementos encontrados en el listado (Mods/Prefabs): {len(mods)}")
-    return mods
-
-
-def parse_date(value):
-    """Intenta convertir una fecha a datetime con zona horaria UTC."""
-    if not value:
-        return None
-
-    value = value.strip()
-
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.astimezone(timezone.utc)
-    except ValueError:
-        pass
-
-    for fmt in (
-        "%Y-%m-%d",
-        "%d.%m.%Y",
-        "%d/%m/%Y",
-        "%m/%d/%Y",
-        "%d-%m-%Y",
-    ):
-        try:
-            return datetime.strptime(value, fmt).replace(tzinfo=timezone.utc)
-        except ValueError:
-            continue
-
-    return None
-
-
-def extract_publication_date(soup):
-    """Busca una fecha explícita."""
-    for tag in soup.find_all("meta"):
-        key = (
-            tag.get("property")
-            or tag.get("name")
-            or tag.get("itemprop")
-            or ""
-        ).lower()
-
-        if key in {
-            "article:published_time",
-            "datepublished",
-            "date",
-            "pubdate",
-        }:
-            result = parse_date(tag.get("content", ""))
-            if result:
-                return result
-
-    for tag in soup.find_all("time"):
-        result = parse_date(tag.get("datetime", "") or tag.get_text(" ", strip=True))
-        if result:
-            return result
-
-    text = soup.get_text(" ", strip=True)
-    patterns = [
-        r"(?:published|release date|date published|added|released|publicado|fecha de publicación)\s*:?\s*(\d{4}-\d{2}-\d{2})",
-        r"(?:published|release date|date published|added|released|publicado|fecha de publicación)\s*:?\s*(\d{1,2}[./-]\d{1,2}[./-]\d{4})",
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, text, flags=re.IGNORECASE)
-        if match:
-            result = parse_date(match.group(1))
-            if result:
-                return result
-
-    return None
-
-
-def get_mod_details(mod):
-    """Obtiene detalles, fecha de publicación, versión y detecta si es un Prefab."""
-    try:
-        soup = get_soup(mod["url"])
-    except requests.RequestException as exc:
-        print(f"No se pudo consultar {mod['name']}: {exc}")
-        return None
-
-    title = soup.find("h1")
-    if title:
-        candidate = title.get_text(" ", strip=True)
-        if candidate:
-            mod["name"] = candidate[:250]
-
-    for tag in soup.find_all("meta"):
-        key = (tag.get("property") or tag.get("name") or "").lower()
-
-        if key == "og:image" and tag.get("content"):
-            mod["image"] = urljoin(mod["url"], tag["content"])
-            break
-
-    mod["published_at"] = extract_publication_date(soup)
-    mod["author"] = "No disponible"
-    mod["category"] = "No disponible"
-    mod["platform"] = "No disponible"
-    mod["version"] = "1.0.0.0"
-
-    text = soup.get_text("\n", strip=True)
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-
-    for index, line in enumerate(lines[:-1]):
-        label = line.lower().rstrip(":")
-        value = lines[index + 1][:200]
-
-        if label in {"author", "modder", "creador", "autor"}:
-            mod["author"] = value
-        elif label in {"category", "categoría", "categoria"}:
-            mod["category"] = value
-        elif label in {"platform", "platforms", "plataforma"}:
-            mod["platform"] = value
-        elif label in {"version", "versión"}:
-            mod["version"] = value
-
-    # Detectar explícitamente si es un Prefab basándose en la categoría o en el nombre
-    is_prefab = False
-    cat_lower = mod["category"].lower()
-    name_lower = mod["name"].lower()
-    if "prefab" in cat_lower or "prefab" in name_lower:
-        is_prefab = True
-    
-    mod["is_prefab"] = is_prefab
-    return mod
-
-
-def is_recent(mod):
-    published_at = mod.get("published_at")
-
-    if not published_at:
-        print(f"Se ignora {mod['name']}: fecha de publicación no verificable.")
-        return False
-
-    now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(days=MAX_AGE_DAYS)
-
-    if published_at > now + timedelta(days=1):
-        print(f"Se ignora {mod['name']}: la fecha parece estar en el futuro.")
-        return False
-
-    if published_at < cutoff:
-        print(f"Se ignora {mod['name']}: publicación antigua ({published_at.date()}).")
-        return False
-
-    return True
-
-
-def send_discord(mod, is_update=False):
-    if not WEBHOOK:
-        raise RuntimeError(
-            "Falta la variable de entorno DISCORD_WEBHOOK."
-        )
-
-    is_prefab = mod.get("is_prefab", False)
-
-    # Definir diseño según el tipo de contenido (Prefab, Actualización o Nuevo Mod)
-    if is_update:
-        title_prefix = "🔄 [ACTUALIZACIÓN]"
-        desc_text = f"¡El elemento **{mod['name']}** se ha actualizado a la versión **{mod['version']}**!"
-        embed_color = 0xF1C40F  # Amarillo
-    elif is_prefab:
-        title_prefix = "📦 [PREFAB]"
-        desc_text = f"¡Nuevo Prefab disponible en el ModHub!"
-        embed_color = 0x3498DB  # Azul distintivo para Prefabs
-    else:
-        title_prefix = "🚜 [NUEVO MOD]"
-        desc_text = f"¡Nuevo mod disponible en Farming Simulator 25!"
-        embed_color = 0x2ECC71  # Verde para nuevos mods
-
-    embed = {
-        "title": f"{title_prefix} {mod['name']}"[:256],
-        "url": mod["url"],
-        "description": (
-            f"{desc_text}\n"
-            f"[Ver detalle en ModHub]({mod['url']})"
-        ),
-        "color": embed_color,
-        "fields": [
-            {
-                "name": "Autor",
-                "value": str(mod.get("author", "No disponible"))[:1024],
-                "inline": True,
-            },
-            {
-                "name": "Categoría",
-                "value": str(mod.get("category", "No disponible"))[:1024],
-                "inline": True,
-            },
-            {
-                "name": "Versión",
-                "value": str(mod.get("version", "1.0.0.0"))[:1024],
-                "inline": True,
-            },
-            {
-                "name": "Plataforma",
-                "value": str(mod.get("platform", "No disponible"))[:1024],
-                "inline": True,
-            },
-            {
-                "name": "Publicado / Actualizado",
-                "value": mod["published_at"].strftime("%d/%m/%Y") if mod.get("published_at") else "No disponible",
-                "inline": True,
-            },
-        ],
+    payload = {
+        "username": "ModHub FS25",
+        "allowed_mentions": {"parse": []},
+        "embeds": [{
+            "author": {"name": heading},
+            "title": html.unescape(mod["title"].strip())[:256],
+            "url": mod["url"],
+            "description": description[:500],
+            "color": 0xF0A000 if is_update else 0x82B440,
+            "image": {"url": "attachment://" + filename},
+            "footer": {"text": footer},
+        }],
     }
 
-    if mod.get("image"):
-        embed["thumbnail"] = {"url": mod["image"]}
+    boundary = "modhub-" + uuid.uuid4().hex
+    data = (
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"payload_json\"\r\n"
+        "Content-Type: application/json\r\n\r\n"
+    ).encode() + json.dumps(payload).encode("utf-8") + (
+        f"\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"files[0]\"; filename=\"{filename}\"\r\n"
+        f"Content-Type: {content_type}\r\n\r\n"
+    ).encode() + image_bytes + f"\r\n--{boundary}--\r\n".encode()
 
-    response = requests.post(
-        WEBHOOK,
-        json={"embeds": [embed]},
-        timeout=TIMEOUT,
-    )
-    response.raise_for_status()
+    for attempt in range(3):
+        try:
+            req = Request(webhook, data=data, headers={
+                "Content-Type": "multipart/form-data; boundary=" + boundary,
+                "User-Agent": USER_AGENT,
+            })
+            with urlopen(req, timeout=30):
+                return
+        except HTTPError as err:
+            if err.code != 429 or attempt == 2:
+                raise
+            try:
+                delay = float(json.loads(err.read())["retry_after"])
+            except (ValueError, KeyError):
+                delay = 5
+            time.sleep(min(max(delay, 1), 30))
 
 
 def main():
+    webhook = os.environ.get("DISCORD_WEBHOOK_URL", "")
+    if not webhook.startswith("https://discord.com/api/webhooks/"):
+        raise RuntimeError("Falta el secreto DISCORD_WEBHOOK_URL")
+
     mods = get_mods()
+    state = load_state()
+    known_ids = set(state.get("legacy_ids", [])) | set(state["mods"].keys())
+    published = baselined = errors = official_updates = 0
 
-    if not mods:
-        print("No se encontraron elementos. No se modifica el estado.")
-        return
-
-    seen = load_state()
-
-    if seen is None:
-        seen = {}
-        for mod_id in mods:
-            seen[mod_id] = "1.0.0.0"
-        save_state(seen)
-        print(
-            f"Primera ejecución: se registraron {len(seen)} elementos "
-            "sin enviar notificaciones."
-        )
-        return
-
-    sent_count = 0
-
-    for mod_id, basic_mod in mods.items():
-        details = get_mod_details(basic_mod)
-
-        if not details:
-            continue
-
-        current_version = details.get("version", "1.0.0.0")
-        saved_version = seen.get(mod_id)
-
-        is_new = mod_id not in seen
-        is_update = not is_new and saved_version != current_version
-
-        if not is_new and not is_update:
-            continue
-
-        if not is_recent(details):
-            seen[mod_id] = current_version
-            save_state(seen)
-            continue
-
+    for mod in reversed(mods):
+        mod_id = mod["id"]
+        old = state["mods"].get(mod_id)
+        was_known = mod_id in known_ids
+        marker = mod.get("marker", "")
         try:
-            send_discord(details, is_update=is_update)
-            tipo_msg = "Prefab" if details.get("is_prefab") else "Mod"
-            action_str = f"Actualización de {tipo_msg}" if is_update else f"Nuevo {tipo_msg}"
-            print(f"{action_str} enviado: {details['name']} (Versión: {current_version})")
-            
-            seen[mod_id] = current_version
-            save_state(seen)
-            sent_count += 1
-        except (requests.RequestException, RuntimeError) as exc:
-            print(f"Error enviando {details['name']}: {exc}")
+            version, platform = get_details(mod)
+        except Exception as exc:
+            print(f"Aviso: {exc}")
+            errors += 1
             continue
 
-        if sent_count >= MAX_NOTIFICATIONS:
-            break
+        mod["version"] = version
+        mod["platform"] = platform
+        title = html.unescape(mod["title"].strip())
 
-    print(f"Proceso terminado. Notificaciones enviadas: {sent_count}")
+        if not was_known:
+            send(webhook, mod, "NEW")
+            state["mods"][mod_id] = {"version": version, "title": title, "last_marker": marker}
+            state["legacy_ids"].append(mod_id)
+            known_ids.add(mod_id)
+            save_state(state)
+            print(f"Publicado NUEVO: {title} v{version} ({mod_id})")
+            published += 1
+            time.sleep(1)
+            continue
+
+        if old is None or not old.get("version"):
+            state["mods"][mod_id] = {"version": version, "title": title, "last_marker": marker}
+            state["legacy_ids"].append(mod_id)
+            save_state(state)
+            print(f"Versión base registrada: {title} v{version} ({mod_id})")
+            baselined += 1
+            continue
+
+        old_version = old.get("version", "")
+        old_marker = old.get("last_marker", "")
+        version_changed = version != old_version
+        fresh_official_update = marker == "UPDATE" and old_marker != "UPDATE"
+
+        if version_changed or fresh_official_update:
+            send(webhook, mod, "UPDATE")
+            state["mods"][mod_id] = {"version": version, "title": title, "last_marker": marker}
+            save_state(state)
+            reason = f"{old_version} -> {version}" if version_changed else "marcado UPDATE! por ModHub"
+            print(f"Publicado UPDATE: {title} ({reason}) ({mod_id})")
+            published += 1
+            if fresh_official_update:
+                official_updates += 1
+            time.sleep(1)
+        elif old.get("title") != title or old_marker != marker:
+            state["mods"][mod_id] = {"version": version, "title": title, "last_marker": marker}
+            save_state(state)
+
+    state["format"] = 3
+    save_state(state)
+    if not published:
+        print("No hay mods nuevos ni cambios de versión/estado UPDATE!.")
+    print(
+        f"Revisados {len(mods)} mods de hasta {MAX_PAGES} páginas · "
+        f"publicados {published} · updates oficiales {official_updates} · "
+        f"bases registradas {baselined} · avisos {errors}"
+    )
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
