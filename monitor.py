@@ -12,7 +12,7 @@ STATE = Path("seen.json")
 WEBHOOK = os.environ["DISCORD_WEBHOOK"]
 
 FS_GREEN = 0x76B900
-MAX_NEW_MODS = 10
+MAX_NEW_MODS = 20
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; FS25ModHubMonitor/2.0)"
@@ -33,7 +33,7 @@ def get_mods():
     mods = {}
 
     for link in soup.find_all("a", href=True):
-        url = urljoin(SOURCE, link["href"])
+        url = absolute_url(link["href"], SOURCE)
         parsed = urlparse(url)
 
         if not parsed.path.endswith("/mod.php"):
@@ -43,6 +43,7 @@ def get_mods():
         if not mod_id:
             continue
 
+        # Buscar la tarjeta del mod, no cualquier sección de la página.
         card = link
         for _ in range(8):
             if card.parent is None:
@@ -59,10 +60,17 @@ def get_mods():
         if not name:
             continue
 
-        image_url = None
-        image = card.find("img", src=True)
-        if image:
-            image_url = urljoin(SOURCE, image["src"])
+        # Comprobar la etiqueta de estado de ESTA tarjeta.
+        card_text = card.get_text(" ", strip=True).upper()
+
+        if "UPDATE!" in card_text:
+            continue
+
+        if "NEW!" not in card_text:
+            continue
+
+        img = card.find("img", src=True)
+        image_url = absolute_url(img["src"], SOURCE) if img else None
 
         mods[str(mod_id)] = {
             "name": name,
@@ -70,10 +78,7 @@ def get_mods():
             "image": image_url,
         }
 
-    if not mods:
-        raise RuntimeError(
-            "No se detectaron mods. Revisa el HTML del ModHub."
-        )
+    print(f"Mods marcados como NEW! detectados: {len(mods)}")
 
     return mods
 
