@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 
+# URL principal de novedades
 SOURCE = "https://www.farming-simulator.com/mods.php?filter=latest"
 STATE = Path("seen.json")
 WEBHOOK = os.getenv("DISCORD_WEBHOOK")
@@ -31,13 +32,12 @@ def get_soup(url):
 
 
 def load_state():
-    """Carga el estado guardado. Ahora soporta diccionario {mod_id: version}."""
+    """Carga el estado guardado {mod_id: version}."""
     if not STATE.exists():
         return None
 
     try:
         data = json.loads(STATE.read_text(encoding="utf-8"))
-        # Compatibilidad con formatos antiguos (listas o sets)
         if isinstance(data, list):
             return {str(item): "1.0.0.0" for item in data}
         if isinstance(data, dict):
@@ -61,7 +61,7 @@ def save_state(seen):
 
 
 def get_mods():
-    """Obtiene los mods listados en la página de novedades de ModHub."""
+    """Obtiene los mods y prefabs listados en la página de novedades de ModHub."""
     soup = get_soup(SOURCE)
     mods = {}
 
@@ -118,7 +118,7 @@ def get_mods():
             "image": image_url,
         }
 
-    print(f"Mods encontrados en el listado: {len(mods)}")
+    print(f"Elementos encontrados en el listado (Mods/Prefabs): {len(mods)}")
     return mods
 
 
@@ -194,7 +194,7 @@ def extract_publication_date(soup):
 
 
 def get_mod_details(mod):
-    """Obtiene detalles, fecha de publicación y versión actual del mod."""
+    """Obtiene detalles, fecha de publicación, versión y detecta si es un Prefab."""
     try:
         soup = get_soup(mod["url"])
     except requests.RequestException as exc:
@@ -236,6 +236,14 @@ def get_mod_details(mod):
         elif label in {"version", "versión"}:
             mod["version"] = value
 
+    # Detectar explícitamente si es un Prefab basándose en la categoría o en el nombre
+    is_prefab = False
+    cat_lower = mod["category"].lower()
+    name_lower = mod["name"].lower()
+    if "prefab" in cat_lower or "prefab" in name_lower:
+        is_prefab = True
+    
+    mod["is_prefab"] = is_prefab
     return mod
 
 
@@ -266,11 +274,17 @@ def send_discord(mod, is_update=False):
             "Falta la variable de entorno DISCORD_WEBHOOK."
         )
 
-    # Cambiar el título y color según si es nuevo o una actualización
+    is_prefab = mod.get("is_prefab", False)
+
+    # Definir diseño según el tipo de contenido (Prefab, Actualización o Nuevo Mod)
     if is_update:
         title_prefix = "🔄 [ACTUALIZACIÓN]"
-        desc_text = f"¡El mod **{mod['name']}** se ha actualizado a la versión **{mod['version']}**!"
-        embed_color = 0xF1C40F  # Amarillo/Naranja para actualizaciones
+        desc_text = f"¡El elemento **{mod['name']}** se ha actualizado a la versión **{mod['version']}**!"
+        embed_color = 0xF1C40F  # Amarillo
+    elif is_prefab:
+        title_prefix = "📦 [PREFAB]"
+        desc_text = f"¡Nuevo Prefab disponible en el ModHub!"
+        embed_color = 0x3498DB  # Azul distintivo para Prefabs
     else:
         title_prefix = "🚜 [NUEVO MOD]"
         desc_text = f"¡Nuevo mod disponible en Farming Simulator 25!"
@@ -281,7 +295,7 @@ def send_discord(mod, is_update=False):
         "url": mod["url"],
         "description": (
             f"{desc_text}\n"
-            f"[Ver mod en ModHub]({mod['url']})"
+            f"[Ver detalle en ModHub]({mod['url']})"
         ),
         "color": embed_color,
         "fields": [
@@ -328,23 +342,18 @@ def main():
     mods = get_mods()
 
     if not mods:
-        print("No se encontraron mods. No se modifica el estado.")
+        print("No se encontraron elementos. No se modifica el estado.")
         return
 
     seen = load_state()
 
-    # Primera ejecución: registra los mods actuales sin enviar avisos masivos
     if seen is None:
-        seen = {mod_id: info.get("version", "1.0.0.0") for mod_id, info in mods.items()}
-        # Nota: En la primera ejecución podemos precargar las versiones obteniendo detalles de forma ligera o asignando una por defecto, 
-        # pero para simplificar, mapeamos los IDs con una versión base o vacía para que detecte futuras actualizaciones o nuevos con seguridad.
-        # Rellenemos consultando rápidamente o por defecto:
         seen = {}
         for mod_id in mods:
             seen[mod_id] = "1.0.0.0"
         save_state(seen)
         print(
-            f"Primera ejecución: se registraron {len(seen)} mods "
+            f"Primera ejecución: se registraron {len(seen)} elementos "
             "sin enviar notificaciones."
         )
         return
@@ -360,24 +369,22 @@ def main():
         current_version = details.get("version", "1.0.0.0")
         saved_version = seen.get(mod_id)
 
-        # Determinar si es completamente nuevo o una actualización
         is_new = mod_id not in seen
         is_update = not is_new and saved_version != current_version
 
         if not is_new and not is_update:
-            # Ya visto y con la misma versión, se omite
             continue
 
         if not is_recent(details):
-            # Si no es reciente, se actualiza en el registro con su versión actual para no reevaluarlo
             seen[mod_id] = current_version
             save_state(seen)
             continue
 
         try:
             send_discord(details, is_update=is_update)
-            action_str = "Actualización enviada" if is_update else "Notificación enviada"
-            print(f"{action_str}: {details['name']} (Versión: {current_version})")
+            tipo_msg = "Prefab" if details.get("is_prefab") else "Mod"
+            action_str = f"Actualización de {tipo_msg}" if is_update else f"Nuevo {tipo_msg}"
+            print(f"{action_str} enviado: {details['name']} (Versión: {current_version})")
             
             seen[mod_id] = current_version
             save_state(seen)
