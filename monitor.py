@@ -1,4 +1,3 @@
-
 import os
 import re
 import json
@@ -32,24 +31,31 @@ def get_soup(url):
 
 
 def load_state():
+    """Carga el estado guardado. Ahora soporta diccionario {mod_id: version}."""
     if not STATE.exists():
         return None
 
     try:
         data = json.loads(STATE.read_text(encoding="utf-8"))
+        # Compatibilidad con formatos antiguos (listas o sets)
         if isinstance(data, list):
-            return set(str(item) for item in data)
+            return {str(item): "1.0.0.0" for item in data}
         if isinstance(data, dict):
-            return set(str(item) for item in data.get("seen", []))
+            seen_data = data.get("seen", data)
+            if isinstance(seen_data, list):
+                return {str(item): "1.0.0.0" for item in seen_data}
+            if isinstance(seen_data, dict):
+                return {str(k): str(v) for k, v in seen_data.items()}
     except (json.JSONDecodeError, OSError):
         print("Aviso: no se pudo leer seen.json. Se iniciará un estado nuevo.")
 
-    return set()
+    return {}
 
 
 def save_state(seen):
+    """Guarda el diccionario de estados {mod_id: version}."""
     STATE.write_text(
-        json.dumps({"seen": sorted(seen)}, ensure_ascii=False, indent=2),
+        json.dumps({"seen": seen}, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
@@ -147,7 +153,7 @@ def parse_date(value):
 
 
 def extract_publication_date(soup):
-    """Busca una fecha explícita; no inventa fechas si no las encuentra."""
+    """Busca una fecha explícita."""
     for tag in soup.find_all("meta"):
         key = (
             tag.get("property")
@@ -171,9 +177,7 @@ def extract_publication_date(soup):
         if result:
             return result
 
-    # Busca etiquetas de fecha en el texto visible.
     text = soup.get_text(" ", strip=True)
-
     patterns = [
         r"(?:published|release date|date published|added|released|publicado|fecha de publicación)\s*:?\s*(\d{4}-\d{2}-\d{2})",
         r"(?:published|release date|date published|added|released|publicado|fecha de publicación)\s*:?\s*(\d{1,2}[./-]\d{1,2}[./-]\d{4})",
@@ -190,7 +194,7 @@ def extract_publication_date(soup):
 
 
 def get_mod_details(mod):
-    """Obtiene detalles e intenta verificar la fecha de publicación."""
+    """Obtiene detalles, fecha de publicación y versión actual del mod."""
     try:
         soup = get_soup(mod["url"])
     except requests.RequestException as exc:
@@ -214,6 +218,7 @@ def get_mod_details(mod):
     mod["author"] = "No disponible"
     mod["category"] = "No disponible"
     mod["platform"] = "No disponible"
+    mod["version"] = "1.0.0.0"
 
     text = soup.get_text("\n", strip=True)
     lines = [line.strip() for line in text.splitlines() if line.strip()]
@@ -228,6 +233,8 @@ def get_mod_details(mod):
             mod["category"] = value
         elif label in {"platform", "platforms", "plataforma"}:
             mod["platform"] = value
+        elif label in {"version", "versión"}:
+            mod["version"] = value
 
     return mod
 
@@ -253,20 +260,30 @@ def is_recent(mod):
     return True
 
 
-def send_discord(mod):
+def send_discord(mod, is_update=False):
     if not WEBHOOK:
         raise RuntimeError(
             "Falta la variable de entorno DISCORD_WEBHOOK."
         )
 
+    # Cambiar el título y color según si es nuevo o una actualización
+    if is_update:
+        title_prefix = "🔄 [ACTUALIZACIÓN]"
+        desc_text = f"¡El mod **{mod['name']}** se ha actualizado a la versión **{mod['version']}**!"
+        embed_color = 0xF1C40F  # Amarillo/Naranja para actualizaciones
+    else:
+        title_prefix = "🚜 [NUEVO MOD]"
+        desc_text = f"¡Nuevo mod disponible en Farming Simulator 25!"
+        embed_color = 0x2ECC71  # Verde para nuevos mods
+
     embed = {
-        "title": f"🚜 {mod['name']}"[:256],
+        "title": f"{title_prefix} {mod['name']}"[:256],
         "url": mod["url"],
         "description": (
-            f"¡Nuevo mod disponible en Farming Simulator 25!\n"
+            f"{desc_text}\n"
             f"[Ver mod en ModHub]({mod['url']})"
         ),
-        "color": 0x2ECC71,
+        "color": embed_color,
         "fields": [
             {
                 "name": "Autor",
@@ -279,13 +296,18 @@ def send_discord(mod):
                 "inline": True,
             },
             {
+                "name": "Versión",
+                "value": str(mod.get("version", "1.0.0.0"))[:1024],
+                "inline": True,
+            },
+            {
                 "name": "Plataforma",
                 "value": str(mod.get("platform", "No disponible"))[:1024],
                 "inline": True,
             },
             {
-                "name": "Publicado",
-                "value": mod["published_at"].strftime("%d/%m/%Y"),
+                "name": "Publicado / Actualizado",
+                "value": mod["published_at"].strftime("%d/%m/%Y") if mod.get("published_at") else "No disponible",
                 "inline": True,
             },
         ],
@@ -311,10 +333,15 @@ def main():
 
     seen = load_state()
 
-    # Primera ejecución: registra los mods actuales sin enviar avisos
-    # masivos por contenido que ya estaba publicado.
+    # Primera ejecución: registra los mods actuales sin enviar avisos masivos
     if seen is None:
-        seen = set(mods.keys())
+        seen = {mod_id: info.get("version", "1.0.0.0") for mod_id, info in mods.items()}
+        # Nota: En la primera ejecución podemos precargar las versiones obteniendo detalles de forma ligera o asignando una por defecto, 
+        # pero para simplificar, mapeamos los IDs con una versión base o vacía para que detecte futuras actualizaciones o nuevos con seguridad.
+        # Rellenemos consultando rápidamente o por defecto:
+        seen = {}
+        for mod_id in mods:
+            seen[mod_id] = "1.0.0.0"
         save_state(seen)
         print(
             f"Primera ejecución: se registraron {len(seen)} mods "
@@ -325,31 +352,38 @@ def main():
     sent_count = 0
 
     for mod_id, basic_mod in mods.items():
-        if mod_id in seen:
-            continue
-
         details = get_mod_details(basic_mod)
 
         if not details:
-            # No se marca como visto: podrá volver a comprobarse después.
+            continue
+
+        current_version = details.get("version", "1.0.0.0")
+        saved_version = seen.get(mod_id)
+
+        # Determinar si es completamente nuevo o una actualización
+        is_new = mod_id not in seen
+        is_update = not is_new and saved_version != current_version
+
+        if not is_new and not is_update:
+            # Ya visto y con la misma versión, se omite
             continue
 
         if not is_recent(details):
-            # Se marca para no revisar repetidamente un mod antiguo
-            # o cuya fecha no se puede verificar.
-            seen.add(mod_id)
+            # Si no es reciente, se actualiza en el registro con su versión actual para no reevaluarlo
+            seen[mod_id] = current_version
             save_state(seen)
             continue
 
         try:
-            send_discord(details)
-            print(f"Notificación enviada: {details['name']}")
-            seen.add(mod_id)
+            send_discord(details, is_update=is_update)
+            action_str = "Actualización enviada" if is_update else "Notificación enviada"
+            print(f"{action_str}: {details['name']} (Versión: {current_version})")
+            
+            seen[mod_id] = current_version
             save_state(seen)
             sent_count += 1
         except (requests.RequestException, RuntimeError) as exc:
             print(f"Error enviando {details['name']}: {exc}")
-            # No se marca como visto si Discord no confirma el envío.
             continue
 
         if sent_count >= MAX_NOTIFICATIONS:
