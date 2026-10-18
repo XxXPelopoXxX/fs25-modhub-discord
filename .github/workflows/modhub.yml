@@ -1,15 +1,15 @@
-name: Novedades ModHub FS25
+name: FS25 ModHub Monitor
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '7,37 * * * *'
+    - cron: '7,22,37,52 * * * *'
 
 permissions:
   contents: write
 
 concurrency:
-  group: modhub-fs25
+  group: fs25-modhub-monitor
   cancel-in-progress: false
 
 jobs:
