@@ -1,93 +1,51 @@
+y este es el modhub.yml 
+name: FS25 ModHub Monitor
+
+on:
   schedule:
-
     - cron: "7,22,37,52 * * * *"
-
   workflow_dispatch:
 
-
-
 permissions:
-
   contents: write
 
-
-
 concurrency:
-
   group: fs25-modhub-monitor
-
   cancel-in-progress: false
 
-
-
 jobs:
-
   monitor:
-
     runs-on: ubuntu-latest
-
     steps:
-
       - name: Download repository
-
         uses: actions/checkout@v4
 
-
-
       - name: Set up Python
-
         uses: actions/setup-python@v5
-
         with:
-
           python-version: "3.12"
 
-
-
       - name: Install dependencies
-
         run: pip install -r requirements.txt
 
-
-
       - name: Check ModHub
-
         env:
-
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-
         run: python monitor.py
 
-
-
       - name: Test Discord webhook
-
         if: ${{ github.event_name == 'workflow_dispatch' }}
-
         env:
-
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-
         run: |
-
           python -c "import os, requests; r=requests.post(os.environ['DISCORD_WEBHOOK'], json={'content':'✅ Prueba de conexión: el webhook de FS25 funciona.'}, timeout=20); r.raise_for_status(); print('Discord respondió:', r.status_code)"
 
-
-
       - name: Save detected mods
-
         run: |
-
           git config user.name "github-actions[bot]"
-
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
           git add seen.json
-
           git diff --cached --quiet || (
-
             git commit -m "Update detected mods" &&
-
             git push
-
-          ) 
+          )
